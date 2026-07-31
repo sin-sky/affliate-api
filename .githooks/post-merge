@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# post-merge — git-lfs への委譲のみ（core.hooksPath が .git/hooks を影に入れるため）
+if command -v git-lfs >/dev/null 2>&1; then
+  git lfs post-merge "$@"
+fi
+exit 0
