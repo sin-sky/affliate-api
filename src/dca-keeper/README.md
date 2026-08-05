@@ -14,7 +14,7 @@ vault ポジションにしか入金できない=非カストディ)。
 
 | ファイル | 役割 |
 |---|---|
-| `dca-keeper.service.ts` | `@Cron` で毎月1日に due プランを集めて `executeBatch` を呼ぶ。冪等・リトライ・監視。 |
+| `dca-keeper.service.ts` | `@Cron` で**毎時**（05分）due プランを集めて `executeBatch` を呼ぶ。冪等・リトライ・監視。 |
 | `dca-keeper.module.ts` | NestJS module。`ScheduleModule.forRoot()` と併せて `AppModule` に import。 |
 | `dca-scheduler.abi.ts` | keeper が使う最小 ABI(手書き)。 |
 
@@ -50,3 +50,18 @@ DCA_KEEPER_PRIVATE_KEY=0x...       # 専用 keeper EOA(用途分離)。要 SHIN 
 - **DCAScheduler の deploy アドレス**: broadcast は人間。deploy 後 `DCA_SCHEDULER_ADDRESS` を設定。
 - **`setKeeper(cronEOA, true)`**: governance(Safe/Timelock)が実行してはじめて keeper が有効。
 - **push 方針**: 空リポへの初回 commit。push は SHIN 承認後(本スケッチはローカル commit のみ)。
+
+## ⚠️ 既知の穴（2026-08-05 点検）
+
+1. **BTC 積立（現物経路）には keeper が無い。** 本 keeper が知っているのは `DCAScheduler`
+   （金庫経路＝ETH/BNB）だけで、`DCASpotAccumulator`（BTC 現物買付）を叩く実装は**存在しない**。
+   このままでは BTC 積立は登録できても**一度も実行されない**。あちらの `execute(planId, minOut)`
+   は keeper 側で `minOut` を用意する必要があり（オラクル値 × 許容スリッページ）、
+   本 keeper の「呼ぶだけ」より一段複雑。**独立タスク**。
+2. **叩く頻度が毎月1日だけだった**（2026-08-05 に毎時へ修正）。商品は毎日・毎週・毎月の3つを
+   出しているので、月1回では毎日/毎週のプランが月1回しか実行されない。**再発防止の検査は無い**
+   ＝商品の頻度を増やすときは cron を見ること。
+3. **死活監視が無い。** `logger` に出しているだけで、tick が止まっても誰も気づかない。
+   ADR-020 の自動一時停止は「引き落とせない状態が続いた時間」で測るので、**keeper が止まると
+   ユーザーのプランは止まらないまま実行されない**（画面上は healthy に見える）。
+4. **build 検証が一度も通っていない**（NestJS scaffold 未作成）。型は目視のみ。

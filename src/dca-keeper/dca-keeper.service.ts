@@ -27,6 +27,7 @@ import { ethers } from 'ethers';
 import { DCA_SCHEDULER_ABI } from './dca-scheduler.abi';
 
 const BATCH_SIZE = 40; // executeBatch 1回あたりの上限 (gas 見合いで調整)
+const SCAN_CONCURRENCY = 20; // isDue の並行読み取り数 (RPC のレート制限見合い)
 const MAX_RETRIES = 3;
 const KEEPER_MIN_GAS_WEI = ethers.parseEther('0.02'); // ガス残高アラート閾値 (例)
 
@@ -36,6 +37,8 @@ export class DCAKeeperService {
   private readonly provider: ethers.JsonRpcProvider;
   private readonly signer: ethers.Wallet;
   private readonly scheduler: ethers.Contract;
+  /** 毎時 tick の再入防止（前回が終わる前に次が来たら飛ばす）。 */
+  private running = false;
 
   constructor() {
     // ── 環境変数 (シークレット。専用 keeper EOA・用途分離。要 SHIN の鍵運用決定) ──
@@ -49,12 +52,30 @@ export class DCAKeeperService {
   }
 
   /**
-   * 毎月1日 00:05 UTC に実行。実際の課金周期はコントラクトの nextRun が支配し、
-   * ここでは「その時点で due な全プランを叩く」だけ。
+   * **毎時 05 分**に実行する。実際の周期はコントラクトの `nextRun` が支配し、ここでは
+   * 「その時点で due な全プランを叩く」だけなので、叩く回数を増やしても二重入金は起きない
+   * （`nextRun` 未到来は `DCA: not due` で revert → `executeBatch` が skip する）。
+   *
+   * ⚠️ **旧実装は毎月1日だけだった**（`'5 0 1 * *'`）。商品は**毎日・毎週・毎月**の3つを
+   * 出しているので、月1回しか叩かないと**毎日/毎週のプランが月1回しか実行されない**。
+   * 契約の `MIN_INTERVAL = 1 hours` に合わせて毎時にすると、どの頻度でも「期日の当日中」に
+   * 実行される。ユーザーから見える遅延は最大1時間。
+   *
+   * 実行が重い場合に絞るのは cron の間隔ではなく `collectDuePlanIds`（DB 索引で候補を絞る）側。
    */
-  @Cron('5 0 1 * *', { name: 'dca-monthly', timeZone: 'UTC' })
-  async runMonthly(): Promise<void> {
-    await this.tick();
+  @Cron('5 * * * *', { name: 'dca-hourly', timeZone: 'UTC' })
+  async runHourly(): Promise<void> {
+    if (this.running) {
+      // 前の tick がまだ終わっていない（プラン数が多い / RPC が遅い）。重ねて走らせない。
+      this.logger.warn('previous DCA tick still running — skipping this hour');
+      return;
+    }
+    this.running = true;
+    try {
+      await this.tick();
+    } finally {
+      this.running = false;
+    }
   }
 
   /** 冪等・再入不可の1サイクル。手動起動 (管理エンドポイント) からも呼べる。 */
@@ -86,12 +107,26 @@ export class DCAKeeperService {
   private async collectDuePlanIds(): Promise<bigint[]> {
     const next: bigint = await this.scheduler.nextPlanId();
     const due: bigint[] = [];
-    for (let id = 1n; id < next; id++) {
-      try {
-        if (await this.scheduler.isDue(id)) due.push(id);
-      } catch (e) {
-        this.logger.error(`isDue(${id}) failed: ${errMsg(e)}`);
-      }
+    // 直列に await すると RPC の往復がプラン数ぶん積み上がり、毎時 tick では現実的でない。
+    // ID をまとめて並べ、`SCAN_CONCURRENCY` 件ずつ並行に読む（読み取りのみ・順序は問わない）。
+    const ids: bigint[] = [];
+    for (let id = 1n; id < next; id++) ids.push(id);
+    for (let i = 0; i < ids.length; i += SCAN_CONCURRENCY) {
+      const chunk = ids.slice(i, i + SCAN_CONCURRENCY);
+      const flags = await Promise.all(
+        chunk.map(async (id) => {
+          try {
+            return (await this.scheduler.isDue(id)) as boolean;
+          } catch (e) {
+            // 1件の読み取り失敗で tick 全体を落とさない（次の周期で拾える）。
+            this.logger.error(`isDue(${id}) failed: ${errMsg(e)}`);
+            return false;
+          }
+        }),
+      );
+      chunk.forEach((id, k) => {
+        if (flags[k]) due.push(id);
+      });
     }
     return due;
   }
